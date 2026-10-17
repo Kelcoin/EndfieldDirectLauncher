@@ -1,0 +1,10 @@
+# Rust build output
+/target
+
+# Local evidence and runtime logs
+/.testout
+*.log
+
+# Reference material only: the MaaEnd checkout this program learned the launch
+# sequence from. Not part of the program itself.
+/docs

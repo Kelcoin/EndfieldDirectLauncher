@@ -1,0 +1,18 @@
+[package]
+name = "endfield-direct-launcher"
+version = "0.1.0"
+edition = "2021"
+description = "Start Endfield.exe directly, bypassing the Hypergryph launcher UI"
+
+[[bin]]
+name = "EndfieldDirectLauncher"
+path = "src/main.rs"
+
+# No dependencies: everything is raw Win32 FFI.
+[dependencies]
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+strip = true
