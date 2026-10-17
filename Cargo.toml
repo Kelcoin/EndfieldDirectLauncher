@@ -3,6 +3,7 @@ name = "endfield-direct-launcher"
 version = "0.1.0"
 edition = "2021"
 description = "Start Endfield.exe directly, bypassing the Hypergryph launcher UI"
+license = "MIT"
 
 [[bin]]
 name = "EndfieldDirectLauncher"
