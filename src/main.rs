@@ -556,6 +556,25 @@ fn start_game(game_exe: &Path, game_dir: &Path, parent: HANDLE) -> Result<Child,
     Ok(Child { process: info.hProcess, pid: info.dwProcessId })
 }
 
+// ---------------------------------------------------------------- steam app id hint
+
+/// Delete the Steam app-id hint the game leaves in its own directory.
+///
+/// `steam_appid.txt` is how Steam decides which app id to attribute the process it launched
+/// to. The game rewrites the file on every run with that session's app id, so a launch that
+/// did not come from Steam (this tool started by hand, or the official launcher) leaves the
+/// game's own app id `457962` behind — and the *next* Steam launch is then attributed to
+/// 457962 instead of the shortcut, so the library entry never shows "playing". Removing it
+/// once the game is gone keeps every later Steam launch on the shortcut's own app id.
+fn clear_steam_appid_hint(game_dir: &Path) {
+    let hint = game_dir.join("steam_appid.txt");
+    match std::fs::remove_file(&hint) {
+        Ok(()) => log(&format!("removed {} (Steam app id hint)", hint.display())),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => log(&format!("could not remove {}: {}", hint.display(), error)),
+    }
+}
+
 // ---------------------------------------------------------------- entry point
 
 fn arg_value(args: &[String], name: &str) -> Option<String> {
@@ -622,6 +641,7 @@ fn run(args: &[String]) -> Result<(), String> {
         game.close();
         parent.close();
     }
+    clear_steam_appid_hint(&game_dir);
     log("game exited");
     Ok(())
 }

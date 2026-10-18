@@ -1,6 +1,6 @@
 [package]
 name = "endfield-direct-launcher"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 description = "Start Endfield.exe directly, bypassing the Hypergryph launcher UI"
 license = "MIT"
