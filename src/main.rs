@@ -3,16 +3,26 @@
 //! Why a plain `Start-Process Endfield.exe` does not work:
 //! the game ships `OneChannelLC.dll` ("LC" = launch check). At SDK init it takes a
 //! toolhelp snapshot, walks to its own parent PID, resolves the parent's image path with
-//! `QueryFullProcessImageNameW` and compares the file *name* against a configured list.
-//! Only `Games.exe` (the launcher's game-launch helper) is accepted; anything else
-//! (explorer.exe, steam.exe, maaend.exe) yields
-//! `{"code":1,"msg":{"errorCode":10100,"filePath":"..."}}` followed by
-//! `PC launch auth extraInfo failed` and a "start the official launcher" prompt.
+//! `QueryFullProcessImageNameW`, and applies two checks to it:
 //!
-//! The bypass is therefore not a patch but a parenting trick: `Games.exe` is created
-//! suspended and then named as the new process' parent via
-//! `PROC_THREAD_ATTRIBUTE_PARENT_PROCESS`, so the kernel reports `games.exe` as the
-//! parent while nothing of the launcher ever runs.
+//!   1. the image *file name* must be `Games.exe` (the launcher's game-launch helper), and
+//!   2. the image must carry a valid Authenticode signature from the client's publisher.
+//!
+//! Both are required, and they fail differently. A wrong name is reported as
+//! `Not found matched name` with `errorCode: 10100`; a correctly named but unsigned parent is
+//! reported as `Parent process verify signature failed:..., 2148204800` (`0x800B0100`,
+//! `TRUST_E_NOSIGNATURE`) with `errorCode: 10101`. Either way the game then logs
+//! `PC launch auth extraInfo failed` and asks for the official launcher. Note that the check
+//! lives in `OneChannelLC.dll` but the signature API is resolved at run time
+//! (`LoadLibraryExA` + `GetProcAddress`), so it does *not* appear in that module's import table.
+//!
+//! The bypass is therefore not a patch but a parenting trick: a publisher-signed executable is
+//! copied to a temporary file *named* `Games.exe`, created suspended, and named as the new
+//! process' parent via `PROC_THREAD_ATTRIBUTE_PARENT_PROCESS`. The kernel then reports
+//! `games.exe` as the parent while not one instruction of that binary ever runs. The check
+//! ignores where the parent lives — only its name and signature matter — so the copy can sit in
+//! `%TEMP%`, and the official launcher does not have to be installed at all. Any signed
+//! executable of the client will do, so we take one that ships inside the game directory.
 //!
 //! Elevation is declared in the binary manifest (`build.rs` passes
 //! `/MANIFESTUAC:level='requireAdministrator'`) because `Endfield.exe` is itself
@@ -22,7 +32,7 @@
 //! Steam's overlay can only follow into the game if the whole chain belongs to the process
 //! Steam injected it into.
 //!
-//! No dependencies; raw `kernel32` / `advapi32` / `user32` FFI only.
+//! No dependencies; raw `kernel32` / `user32` FFI only.
 
 #![windows_subsystem = "windows"]
 #![allow(non_snake_case, non_camel_case_types, clippy::upper_case_acronyms)]
@@ -40,17 +50,20 @@ use std::ptr::null_mut;
 /// `games.log` -> `cgsu create game process ... strCmdLine:"...\Endfield.exe" -launcher_lang=zh-cn -launcher_sub_channel=1`
 const LAUNCHER_ARGS: &str = "-launcher_lang=zh-cn -launcher_sub_channel=1";
 
-/// CN region identifiers, taken verbatim from MaaEnd's
-/// `agent/go-service/pretask/launchgamepc/launchgamepc.go` (`regionCN`).
-const CN_UNINSTALL_KEY: &str = "33a0a6296a20400d503c59ac0fd6341e";
-const CN_PROTOCOL_KEY: &str = "hypergryphlauncher-abYeZZ16BPluCFyT";
-const UNINSTALL_PREFIX: &str = r"SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\";
+/// Executables inside the game directory that carry the publisher's signature and can therefore
+/// stand in as the parent. They are only ever copied and suspended, never resumed. Ordered by
+/// preference: smallest first, and `PlatformProcess.exe` is the platform helper the client ships
+/// for exactly this kind of side-by-side role.
+const PARENT_SOURCES: [&str; 3] = [
+    "PlatformProcess.exe",
+    "QtWebEngineProcess.exe",
+    "UnityCrashHandler64.exe",
+];
 
 // ---------------------------------------------------------------- Win32 FFI
 
 type HANDLE = *mut c_void;
 type BOOL = i32;
-type HKEY = usize;
 
 const STARTF_USESHOWWINDOW: u32 = 0x0000_0001;
 const SW_HIDE: u16 = 0;
@@ -65,13 +78,9 @@ const MB_OK: u32 = 0x0000_0000;
 const MB_ICONERROR: u32 = 0x0000_0010;
 const MB_ICONINFORMATION: u32 = 0x0000_0040;
 
-const HKEY_CLASSES_ROOT: HKEY = 0x8000_0000;
-const HKEY_CURRENT_USER: HKEY = 0x8000_0001;
-const HKEY_LOCAL_MACHINE: HKEY = 0x8000_0002;
-const KEY_QUERY_VALUE: u32 = 0x0001;
-const KEY_WOW64_32KEY: u32 = 0x0200;
-const KEY_WOW64_64KEY: u32 = 0x0100;
-const REG_SZ: u32 = 1;
+/// `JOBOBJECT_EXTENDED_LIMIT_INFORMATION` and `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`.
+const JOB_OBJECT_EXTENDED_LIMIT_INFORMATION: i32 = 9;
+const JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE: u32 = 0x0000_2000;
 
 #[repr(C)]
 struct STARTUPINFOW {
@@ -121,6 +130,39 @@ struct SYSTEMTIME {
     wMilliseconds: u16,
 }
 
+#[repr(C)]
+struct IO_COUNTERS {
+    ReadOperationCount: u64,
+    WriteOperationCount: u64,
+    OtherOperationCount: u64,
+    ReadTransferCount: u64,
+    WriteTransferCount: u64,
+    OtherTransferCount: u64,
+}
+
+#[repr(C)]
+struct JOBOBJECT_BASIC_LIMIT_INFORMATION {
+    PerProcessUserTimeLimit: i64,
+    PerJobUserTimeLimit: i64,
+    LimitFlags: u32,
+    MinimumWorkingSetSize: usize,
+    MaximumWorkingSetSize: usize,
+    ActiveProcessLimit: u32,
+    Affinity: usize,
+    PriorityClass: u32,
+    SchedulingClass: u32,
+}
+
+#[repr(C)]
+struct JOBOBJECT_EXTENDED_LIMIT_INFORMATION {
+    BasicLimitInformation: JOBOBJECT_BASIC_LIMIT_INFORMATION,
+    IoInfo: IO_COUNTERS,
+    ProcessMemoryLimit: usize,
+    JobMemoryLimit: usize,
+    PeakProcessMemoryUsed: usize,
+    PeakJobMemoryUsed: usize,
+}
+
 #[link(name = "kernel32")]
 extern "system" {
     fn GetModuleFileNameW(hModule: HANDLE, lpFilename: *mut u16, nSize: u32) -> u32;
@@ -152,6 +194,14 @@ extern "system" {
         lpReturnSize: *mut usize,
     ) -> BOOL;
     fn DeleteProcThreadAttributeList(lpAttributeList: *mut c_void);
+    fn CreateJobObjectW(lpJobAttributes: *mut c_void, lpName: *const u16) -> HANDLE;
+    fn SetInformationJobObject(
+        hJob: HANDLE,
+        JobObjectInformationClass: i32,
+        lpJobObjectInformation: *const c_void,
+        cbJobObjectInformationLength: u32,
+    ) -> BOOL;
+    fn AssignProcessToJobObject(hJob: HANDLE, hProcess: HANDLE) -> BOOL;
     fn TerminateProcess(hProcess: HANDLE, uExitCode: u32) -> BOOL;
     fn WaitForSingleObject(hHandle: HANDLE, dwMilliseconds: u32) -> u32;
     fn CloseHandle(hObject: HANDLE) -> BOOL;
@@ -173,26 +223,6 @@ extern "system" {
     fn MessageBoxW(hWnd: HANDLE, lpText: *const u16, lpCaption: *const u16, uType: u32) -> i32;
 }
 
-#[link(name = "advapi32")]
-extern "system" {
-    fn RegOpenKeyExW(
-        hKey: HKEY,
-        lpSubKey: *const u16,
-        ulOptions: u32,
-        samDesired: u32,
-        phkResult: *mut HKEY,
-    ) -> i32;
-    fn RegQueryValueExW(
-        hKey: HKEY,
-        lpValueName: *const u16,
-        lpReserved: *mut u32,
-        lpType: *mut u32,
-        lpData: *mut u8,
-        lpcbData: *mut u32,
-    ) -> i32;
-    fn RegCloseKey(hKey: HKEY) -> i32;
-}
-
 // ---------------------------------------------------------------- small helpers
 
 fn wide(s: &str) -> Vec<u16> {
@@ -201,6 +231,20 @@ fn wide(s: &str) -> Vec<u16> {
 
 fn wide_path(p: &Path) -> Vec<u16> {
     p.as_os_str().encode_wide().chain(Some(0)).collect()
+}
+
+/// `"<exe>" <args>` as UTF-16, assembled from the path itself instead of `Path::display()` so
+/// that a path which is not valid UTF-8 cannot be mangled on the way into the command line.
+fn wide_command_line(exe: &Path, args: &str) -> Vec<u16> {
+    let mut line = vec!['"' as u16];
+    line.extend(exe.as_os_str().encode_wide());
+    line.push('"' as u16);
+    if !args.is_empty() {
+        line.push(' ' as u16);
+        line.extend(OsString::from(args).encode_wide());
+    }
+    line.push(0);
+    line
 }
 
 /// The stdout we can write to, if the caller gave us one (a shell pipe) or `--console`
@@ -277,156 +321,73 @@ fn exe_dir() -> PathBuf {
     path.parent().map(Path::to_path_buf).unwrap_or(path)
 }
 
-// ---------------------------------------------------------------- locating the launcher
+// ---------------------------------------------------------------- the stand-in parent
 
-/// One string value out of the registry, or `None`.
-fn reg_string(root: HKEY, subkey: &str, value: &str, extra_access: u32) -> Option<String> {
-    let mut hkey: HKEY = 0;
-    if unsafe {
-        RegOpenKeyExW(
-            root,
-            wide(subkey).as_ptr(),
-            0,
-            KEY_QUERY_VALUE | extra_access,
-            &mut hkey,
-        )
-    } != 0
-    {
-        return None;
-    }
-    let name = wide(value);
-    let mut kind = 0u32;
-    let mut size = 0u32;
-    let status = unsafe {
-        RegQueryValueExW(hkey, name.as_ptr(), null_mut(), &mut kind, null_mut(), &mut size)
-    };
-    if status != 0 || size == 0 || kind != REG_SZ {
-        unsafe { RegCloseKey(hkey) };
-        return None;
-    }
-    let mut buf = vec![0u8; size as usize + 2];
-    let mut filled = size;
-    let status = unsafe {
-        RegQueryValueExW(hkey, name.as_ptr(), null_mut(), &mut kind, buf.as_mut_ptr(), &mut filled)
-    };
-    unsafe { RegCloseKey(hkey) };
-    if status != 0 {
-        return None;
-    }
-    let units: Vec<u16> = buf[..filled as usize]
-        .as_chunks::<2>()
-        .0
+/// Copy a publisher-signed executable from the game directory to a temporary file *named*
+/// `Games.exe`.
+///
+/// The name is what the launch check matches on and the signature is what it verifies; where
+/// the file lives is not part of the check. Staging a copy is therefore enough to satisfy both,
+/// and it keeps the game directory clean — unlike pointing at the official launcher's own
+/// `Games.exe`, which forces the launcher to be installed and its version directories to be
+/// guessed.
+fn stage_parent_exe(game_dir: &Path) -> Result<PathBuf, String> {
+    let source = PARENT_SOURCES
         .iter()
-        .map(|c| u16::from_le_bytes(*c))
-        .collect();
-    let end = units.iter().position(|&c| c == 0).unwrap_or(units.len());
-    Some(String::from_utf16_lossy(&units[..end]))
+        .map(|name| game_dir.join(name))
+        .find(|path| path.is_file())
+        .ok_or_else(|| {
+            format!(
+                "None of the executables this program uses as the parent process exist in\n{}\n\
+                 ({}).\n\nIs this really the game directory?",
+                game_dir.display(),
+                PARENT_SOURCES.join(", ")
+            )
+        })?;
+
+    let staging_dir = std::env::temp_dir().join("EndfieldDirectLauncher");
+    fs::create_dir_all(&staging_dir)
+        .map_err(|e| format!("Could not create {}:\n{}", staging_dir.display(), e))?;
+    let staged = staging_dir.join("Games.exe");
+    fs::copy(&source, &staged).map_err(|e| {
+        format!(
+            "Could not copy\n{}\nto\n{}\n{}",
+            source.display(),
+            staged.display(),
+            e
+        )
+    })?;
+
+    log(&format!(
+        "parent exe: {} (copy of {})",
+        staged.display(),
+        source
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default()
+    ));
+    Ok(staged)
 }
 
-/// Launcher install directories, most trustworthy first. Same lookup order as MaaEnd's
-/// `FindLauncherInstallDir` / `FindLauncherInstallDirByProtocol`.
-fn find_launcher_dirs() -> Vec<PathBuf> {
-    let mut dirs = Vec::new();
-    let subkey = format!("{}{}", UNINSTALL_PREFIX, CN_UNINSTALL_KEY);
-    // The launcher is a 32-bit installer, so its uninstall entry lives in WOW6432Node
-    // (KEY_WOW64_32KEY); the other two views are fallbacks.
-    for (root, access) in [
-        (HKEY_LOCAL_MACHINE, KEY_WOW64_32KEY),
-        (HKEY_LOCAL_MACHINE, KEY_WOW64_64KEY),
-        (HKEY_CURRENT_USER, 0),
-    ] {
-        if let Some(dir) = reg_string(root, &subkey, "InstallLocation", access) {
-            let dir = PathBuf::from(dir.trim().trim_matches('"'));
-            // A stale entry can survive a moved/deleted launcher.
-            if dir.join("Launcher.exe").is_file() {
-                dirs.push(dir);
+/// Drop the staged copy once the placeholder is gone. A leftover would be harmless (the next
+/// run overwrites it) but pointless. Windows releases a terminated process' image section a
+/// moment after the fact, so a few retries are needed before the file will actually go.
+fn remove_staged_parent(path: &Path) {
+    for attempt in 0..10 {
+        match fs::remove_file(path) {
+            Ok(()) => {
+                log(&format!("removed {}", path.display()));
+                return;
             }
-        }
-    }
-
-    let protocol = format!(r"{}\shell\open\command", CN_PROTOCOL_KEY);
-    if let Some(command) = reg_string(HKEY_CLASSES_ROOT, &protocol, "", 0) {
-        if let Some(exe) = first_token_path(&command) {
-            let looks_right = exe
-                .file_name()
-                .map(|n| n.eq_ignore_ascii_case("Launcher.exe"))
-                .unwrap_or(false);
-            if looks_right && exe.is_file() {
-                if let Some(parent) = exe.parent() {
-                    dirs.push(parent.to_path_buf());
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return,
+            Err(error) => {
+                if attempt == 9 {
+                    log(&format!("could not remove {}: {}", path.display(), error));
                 }
+                std::thread::sleep(std::time::Duration::from_millis(150));
             }
         }
     }
-    dirs
-}
-
-/// Fallback for when the registry says nothing: `<root>\games\<Game Dir>` -> `<root>`.
-fn launcher_dirs_from_game_dir(game_dir: &Path) -> Vec<PathBuf> {
-    match game_dir.parent().and_then(Path::parent) {
-        Some(root) => vec![root.to_path_buf()],
-        None => Vec::new(),
-    }
-}
-
-/// `"D:\x\Launcher.exe" "%1"` -> `D:\x\Launcher.exe`
-fn first_token_path(command: &str) -> Option<PathBuf> {
-    let trimmed = command.trim();
-    if let Some(rest) = trimmed.strip_prefix('"') {
-        return Some(PathBuf::from(&rest[..rest.find('"')?]));
-    }
-    let end = trimmed.find(' ').unwrap_or(trimmed.len());
-    Some(PathBuf::from(&trimmed[..end]))
-}
-
-/// `<Games.exe>` either at the launcher root or one version-directory below it
-/// (`<root>\1.6.0\Games.exe`); the newest build wins.
-fn find_games_exe(launcher_dir: &Path) -> Option<PathBuf> {
-    let at_root = launcher_dir.join("Games.exe");
-    if at_root.is_file() {
-        return Some(at_root);
-    }
-    let mut newest: Option<(std::time::SystemTime, PathBuf)> = None;
-    for entry in fs::read_dir(launcher_dir).ok()?.flatten() {
-        let candidate = entry.path().join("Games.exe");
-        if !candidate.is_file() {
-            continue;
-        }
-        let stamp = entry
-            .metadata()
-            .and_then(|m| m.modified())
-            .unwrap_or(std::time::UNIX_EPOCH);
-        if newest.as_ref().map(|(best, _)| stamp > *best).unwrap_or(true) {
-            newest = Some((stamp, candidate));
-        }
-    }
-    newest.map(|(_, path)| path)
-}
-
-/// Resolve the launcher's `Games.exe`, the one file the launch check accepts as parent.
-fn lookup_games_exe(args: &[String], game_dir: &Path) -> Result<PathBuf, String> {
-    let explicit = arg_value(args, "--launcher-dir").map(PathBuf::from);
-    let candidates: Vec<PathBuf> = match explicit {
-        Some(ref dir) => vec![dir.clone()],
-        None => find_launcher_dirs()
-            .into_iter()
-            .chain(launcher_dirs_from_game_dir(game_dir))
-            .collect(),
-    };
-
-    for dir in &candidates {
-        if let Some(exe) = find_games_exe(dir) {
-            log(&format!("launcher dir: {}", dir.display()));
-            return Ok(exe);
-        }
-    }
-
-    Err(match explicit {
-        Some(dir) => format!("No Games.exe inside:\n{}", dir.display()),
-        None => "Could not locate the official launcher, so Games.exe is unavailable.\n\n\
-                 Pass it explicitly, e.g. --launcher-dir \"F:\\Hypergryph Launcher\"."
-            .to_string(),
-    })
 }
 
 // ---------------------------------------------------------------- process creation
@@ -445,15 +406,17 @@ impl Child {
     }
 }
 
-/// Start `Games.exe` suspended: it must exist as a process (so it can be named as parent)
-/// but must never run, otherwise the launcher would do its own thing.
+/// Start the staged `Games.exe` suspended: it must exist as a process (so it can be named as
+/// parent) but must never run, otherwise it would do whatever that binary does on startup.
 fn start_suspended_pseudoparent(games_exe: &Path) -> Result<Child, String> {
     let application = wide_path(games_exe);
-    let mut command_line = wide(&format!("\"{}\"", games_exe.display()));
+    let mut command_line = wide_command_line(games_exe, "");
     let cwd = games_exe.parent().map(wide_path).unwrap_or_else(|| wide("."));
 
     let mut startup: STARTUPINFOEXW = unsafe { std::mem::zeroed() };
-    startup.StartupInfo.cb = std::mem::size_of::<STARTUPINFOEXW>() as u32;
+    // Not an extended startup: no `EXTENDED_STARTUPINFO_PRESENT` and no attribute list, so the
+    // size is the plain structure's, as documented for that case.
+    startup.StartupInfo.cb = std::mem::size_of::<STARTUPINFOW>() as u32;
     startup.StartupInfo.dwFlags = STARTF_USESHOWWINDOW;
     startup.StartupInfo.wShowWindow = SW_HIDE;
 
@@ -482,6 +445,42 @@ fn start_suspended_pseudoparent(games_exe: &Path) -> Result<Child, String> {
     unsafe { CloseHandle(info.hThread) };
     log(&format!("suspended parent: Games.exe pid {}", info.dwProcessId));
     Ok(Child { process: info.hProcess, pid: info.dwProcessId })
+}
+
+/// Make the suspended placeholder die with this process.
+///
+/// It has no code of its own and is never resumed, so it can never exit by itself: if this
+/// process is force-killed the placeholder would sit there forever. A job object with
+/// `KILL_ON_JOB_CLOSE` is the only mechanism that survives `TerminateProcess` — the kernel
+/// closes the handle for us and takes everything in the job down with it.
+fn kill_placeholder_with_us(process: HANDLE) {
+    unsafe {
+        let job = CreateJobObjectW(null_mut(), std::ptr::null());
+        if job.is_null() {
+            log(&format!(
+                "could not create the cleanup job, Win32 error {}",
+                GetLastError()
+            ));
+            return;
+        }
+        let mut limits: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = std::mem::zeroed();
+        limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+        let configured = SetInformationJobObject(
+            job,
+            JOB_OBJECT_EXTENDED_LIMIT_INFORMATION,
+            &limits as *const _ as *const c_void,
+            std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
+        );
+        if configured == 0 || AssignProcessToJobObject(job, process) == 0 {
+            log(&format!(
+                "could not put the suspended parent in a cleanup job, Win32 error {}",
+                GetLastError()
+            ));
+            CloseHandle(job);
+        }
+        // The handle is deliberately never closed: it has to stay open for as long as this
+        // process lives, which is exactly how long the placeholder is wanted.
+    }
 }
 
 /// Start `Endfield.exe` with `parent` as its reported parent process.
@@ -518,7 +517,7 @@ fn start_game(game_exe: &Path, game_dir: &Path, parent: HANDLE) -> Result<Child,
     }
 
     let application = wide_path(game_exe);
-    let mut command_line = wide(&format!("\"{}\" {}", game_exe.display(), LAUNCHER_ARGS));
+    let mut command_line = wide_command_line(game_exe, LAUNCHER_ARGS);
     let cwd = wide_path(game_dir);
 
     let mut startup: STARTUPINFOEXW = unsafe { std::mem::zeroed() };
@@ -591,14 +590,14 @@ Run it from the game directory (the folder holding Endfield.exe).
 Options:
   --console                 attach a console window for progress/errors
   --game-dir <dir>          directory containing Endfield.exe (default: this exe's folder)
-  --launcher-dir <dir>      official launcher install directory, e.g. \"F:\\Hypergryph Launcher\"
   --help                    show this text
 
 How it works:
-  The game's OneChannelLC.dll requires its parent process to be named Games.exe.
-  This tool starts the launcher's Games.exe suspended and creates Endfield.exe
-  with PROC_THREAD_ATTRIBUTE_PARENT_PROCESS pointing at it, so the check passes
-  while no launcher code ever executes."
+  The game's OneChannelLC.dll requires its parent process to be named Games.exe and to
+  carry the publisher's signature. This tool copies a signed executable out of the game
+  directory to a temporary Games.exe, starts it suspended, and creates Endfield.exe with
+  PROC_THREAD_ATTRIBUTE_PARENT_PROCESS pointing at it, so both checks pass while no code
+  of that binary ever runs."
         .to_string()
 }
 
@@ -617,17 +616,27 @@ fn run(args: &[String]) -> Result<(), String> {
     }
     log(&format!("game exe  : {}", game_exe.display()));
 
-    let games_exe = lookup_games_exe(args, &game_dir)?;
-    log(&format!("parent exe: {}", games_exe.display()));
-
-    let mut parent = start_suspended_pseudoparent(&games_exe)?;
+    let parent_exe = stage_parent_exe(&game_dir)?;
+    let mut parent = match start_suspended_pseudoparent(&parent_exe) {
+        Ok(parent) => parent,
+        Err(error) => {
+            remove_staged_parent(&parent_exe);
+            return Err(error);
+        }
+    };
+    // Deliberately created *before* the placeholder joins the cleanup job: a process inherits
+    // the job of the parent named in `PROC_THREAD_ATTRIBUTE_PARENT_PROCESS`, so assigning the
+    // placeholder to the job any earlier would put the game in it as well — and then killing
+    // this program would kill the game, which is the opposite of what the job is for.
     let mut game = match start_game(&game_exe, &game_dir, parent.process) {
         Ok(child) => child,
         Err(error) => {
             unsafe { TerminateProcess(parent.process, 0) };
+            remove_staged_parent(&parent_exe);
             return Err(error);
         }
     };
+    kill_placeholder_with_us(parent.process);
 
     log(&format!(
         "waiting for Endfield.exe (pid {}) to exit; the suspended parent stays alive so the \
@@ -636,12 +645,13 @@ fn run(args: &[String]) -> Result<(), String> {
     ));
     unsafe {
         WaitForSingleObject(game.process, INFINITE);
-        // Nothing of the launcher ever ran; drop the placeholder once the game is gone.
+        // Nothing of that binary ever ran; drop the placeholder once the game is gone.
         TerminateProcess(parent.process, 0);
         game.close();
         parent.close();
     }
     clear_steam_appid_hint(&game_dir);
+    remove_staged_parent(&parent_exe);
     log("game exited");
     Ok(())
 }

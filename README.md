@@ -9,25 +9,42 @@
 
 ## 项目简介
 
-游戏本体不看命令行、注册表和资源文件，它看的是**父进程的映像名**。游戏目录里的
-`OneChannelLC.dll`（LC = launch check）在 SDK 初始化时读取自身父进程的路径，只接受启动器的
-`Games.exe`；父进程是 `explorer.exe`、`steam.exe` 或别的程序，游戏就提示「请用官方启动器启动」
-并拒绝进入：
+游戏本体不看命令行、注册表和资源文件，它看的是**父进程的映像**。游戏目录里的
+`OneChannelLC.dll`（LC = launch check）在 SDK 初始化时读取自身父进程的路径，然后查两件事：
+
+1. 映像文件名必须是 `Games.exe`（启动器的启动助手）；
+2. 该映像必须带**客户端发行商**的有效 Authenticode 签名。
+
+两条都满足才放行，失败码还不一样：名字不对是 `Not found matched name` + `errorCode: 10100`；
+名字对但没签名是 `Parent process verify signature failed:…, 2148204800`（`0x800B0100`
+`TRUST_E_NOSIGNATURE`）+ `errorCode: 10101`。两种情况游戏都会记录 `PC launch auth extraInfo
+failed` 并提示「请用官方启动器启动」：
 
 ```
-[Error] [SDK] [F:3][DLog]PC launch auth extraInfo failed, code: 1, errorCode: 10100, filePath: f:\steam\steam.exe
+[Error] [SDK] [F:3][DLog]PC launch auth extraInfo failed, code: 1, errorCode: 10101, filePath: …
 ```
 
-本程序不改动游戏本体（不碰 exe、dll 与游戏数据）。唯一会被写动的是 Steam 相关的
-`steam_appid.txt`：每次运行结束把它删掉，游戏自己下次启动会重写（原因见 FAQ）。
-它做的是改父进程归属：
+> [!NOTE]
+> 签名校验就在 `OneChannelLC.dll` 里，但那个模块的导入表里**没有** `WinVerifyTrust`——它用
+> `LoadLibraryExA` + `GetProcAddress` 动态取，所以只翻导入表会把它误判成「只比名字」。
 
-1. 以 `CREATE_SUSPENDED` 拉起启动器目录里的 `Games.exe`——它存在，但一条指令都不会执行，
-   所以启动器界面不会出现，也不会触发更新检查。
+本程序不改动游戏本体。它把游戏目录里一个**带发行商签名**的 exe（默认 `PlatformProcess.exe`）
+复制到 `%TEMP%\EndfieldDirectLauncher\Games.exe`，让这份副本充当父进程——检查只看名字和签名，
+不看路径，所以副本放临时目录一样通过，**因此完全不需要安装官方启动器**：
+
+1. 复制那份签名的 exe 成临时文件 `Games.exe`，以 `CREATE_SUSPENDED` 拉起——它存在，但一条指令
+   都不会执行。
 2. 用 `InitializeProcThreadAttributeList` + `UpdateProcThreadAttribute` 声明
    `PROC_THREAD_ATTRIBUTE_PARENT_PROCESS`，把这份挂起的 `Games.exe` 指定为新进程的父进程。
-3. 以该属性 `CreateProcessW` 启动 `Endfield.exe`，内核因此报告父进程是 `games.exe`，检查通过。
-4. 游戏退出后终止那份挂起的 `Games.exe`，不留残留进程。
+3. 以该属性 `CreateProcessW` 启动 `Endfield.exe`，内核因此报告父进程是 `games.exe`，两条检查
+   都通过。
+4. 游戏退出后终止那份挂起的 `Games.exe`、删掉临时副本，不留残留。
+
+> [!NOTE]
+> 那份副本会被放进一个 `KILL_ON_JOB_CLOSE` 的 job 对象，这样本程序被强杀时它也不会残留
+> （挂起的进程永远不会自己退出）。job 是在游戏进程**创建之后**才挂上的：用
+> `PROC_THREAD_ATTRIBUTE_PARENT_PROCESS` 创建的子进程会继承**名义父进程**的 job，挂早了会把
+> 游戏也圈进去，那样杀掉本程序就等于杀掉游戏。
 
 命令行与官方完全一致（取自启动器自己的 `games.log`）：
 
@@ -75,7 +92,6 @@ F:\Hypergryph Launcher\games\Endfield Game\
 EndfieldDirectLauncher.exe                      # 游戏目录下双击即可
 EndfieldDirectLauncher.exe --console            # 附带控制台窗口，看进度
 EndfieldDirectLauncher.exe --game-dir <目录>    # 指定 Endfield.exe 所在目录
-EndfieldDirectLauncher.exe --launcher-dir <目录># 指定启动器目录，如 "F:\Hypergryph Launcher"
 EndfieldDirectLauncher.exe --help
 ```
 
@@ -100,8 +116,9 @@ cargo build --release
 
 ### 为什么不能直接双击 `Endfield.exe`？
 
-因为父进程名不是 `Games.exe`。哪怕从 `explorer.exe`、Steam、其他工具启动，游戏都会在 SDK
-初始化阶段判定失败并退出。必须让父进程是 `Games.exe`——这正是本程序做的事。
+因为父进程既不是 `Games.exe`，也拿不出发行商的签名。哪怕从 `explorer.exe`、Steam、其他工具
+启动，游戏都会在 SDK 初始化阶段判定失败并退出。必须让父进程是一个**名叫 `Games.exe` 且由
+发行商签名的映像**——这正是本程序做的事。
 
 ### 为什么需要管理员权限？
 
@@ -115,13 +132,24 @@ Win32 **740** `ERROR_ELEVATION_REQUIRED` 失败）。本程序同样在清单里
 
 ### 会修改游戏文件吗？有封号风险吗？
 
-不修改。程序只创建两个进程，不打开游戏进程句柄、不按进程名扫描（游戏启动期间按进程名检查
-有触发 ACE 的风险，因此这里只等待句柄）。
+不改游戏本体。程序只**读出**一个带签名的 exe 复制到 `%TEMP%\EndfieldDirectLauncher\`，
+不写游戏目录里的任何 exe、dll 或游戏数据；也不打开游戏进程句柄、不按进程名扫描
+（游戏启动期间按进程名检查有触发 ACE 的风险，因此这里只等待句柄）。
 
-唯一会被写动的文件是游戏目录里的 `steam_appid.txt`——程序在游戏退出后把它删掉。这个文件本来
-就是游戏自己运行时写的，删它是为了修掉它引起的 Steam 归属错乱（见下一节）。
+唯一会被写动的是游戏目录里的 `steam_appid.txt`——程序在游戏退出后把它删掉。这个文件本来
+就是游戏自己运行时写的，删它是为了修掉它引起的 Steam 归属错乱（见下文）。
 
 绕过官方启动器不是官方支持的行为，服务端是否另有校验没有做过长测，请自行判断风险。
+
+### 那个当父进程的 `Games.exe` 是从哪来的？
+
+从游戏目录里挑一个带发行商签名的 exe，默认 `PlatformProcess.exe`，依次退到
+`QtWebEngineProcess.exe`、`UnityCrashHandler64.exe`，复制成
+`%TEMP%\EndfieldDirectLauncher\Games.exe` 再挂起。
+
+这样做的原因：检查只认「名字 + 发行商签名」，而游戏目录里的这些文件本来就由该区服的发行商
+签名（国服是 Shanghai Hypergryph），所以哪个区服就用哪个区服的签名——不必去找官方启动器
+目录，也不必猜它的版本子目录。游戏退出后这份副本会被删掉。
 
 ### Steam 库里不显示「运行中」，只闪一下就没了？
 
@@ -171,20 +199,13 @@ Sat Oct 17 17:59:50 2026 UTC - GameOverlayRenderer.dll detaching
 
 ### 支持国际服 / B 服 / Steam 版吗？
 
-未验证。代码里有目录兜底，理论上同样可用；据社区反馈国际服（GRYPHLINK）本来就不做这项检查。
-本机只验证过国服 1.6.0 客户端。
+未验证。父进程用的是游戏目录自己的签名文件，所以签名天然是那个区服的，理论上同样可用；
+据社区反馈国际服（GRYPHLINK）本来就不做这项检查。本机只验证过国服 1.6.0 客户端。
 
 ### 游戏更新怎么办？
 
 绕过启动器意味着不走更新流程。发现版本落后时，用官方启动器正常启动一次完成更新，
 之后继续用本程序。
-
-### 启动器目录是怎么找到的？
-
-按 MaaEnd 的顺序查找：卸载表 `InstallLocation`（国服 key
-`33a0a6296a20400d503c59ac0fd6341e`，含 `WOW6432Node` 视图）→ URL 协议
-`hypergryphlauncher-abYeZZ16BPluCFyT` 的命令行 → 兜底 `<游戏目录>\..\..`。
-`Games.exe` 取启动器根目录或版本子目录（如 `1.6.0\Games.exe`）中最新的一个。
 
 ### 图标是哪来的？
 
@@ -201,7 +222,21 @@ Sat Oct 17 17:59:50 2026 UTC - GameOverlayRenderer.dll detaching
 | `PC launch auth failed / errorCode 10100` | 出现 | 整份 `Player.log` 里一条都没有 |
 | 游戏窗口 | 无，提示「请用官方启动器启动」 | `Endfield`，`Responding = True` |
 | 进入渲染 | 否 | 是（`HGCreateSwapchain`） |
-| `Endfield.exe` 的父进程 | `explorer.exe` / `steam.exe` | 挂起的 `Games.exe` |
+| `Endfield.exe` 的父进程 | `explorer.exe` / `steam.exe` | 挂起的临时 `Games.exe` |
+
+「两条检查」这个结论是拿同一个夹具（`%TEMP%` 里一份改名为 `Games.exe` 的文件）逐项试出来的：
+
+| 夹具内容 | 结果 |
+| --- | --- |
+| 本程序自己的 exe（未签名） | `10101` / `2148204800` |
+| `notepad.exe`（签名有效，发行商是 Microsoft） | `10101` / `2148204800` |
+| 官方 `Launcher.exe` 改名（Shanghai Hypergryph 签名） | 通过，`code: 0` |
+| 游戏目录 `PlatformProcess.exe` 改名（同发行商） | 通过，`code: 0` |
+
+现在的默认路径同样留了读数：`OneChannelLC.log` 里是
+`Parent process check success:…` + `{"code":2003,"msg":{"code":0,"msg":{"filePath":
+"c:\\users\\…\\temp\\endfielddirectlauncher\\games.exe"}}}`——通过，且父进程路径确实是临时副本。
+另外单独验过收尾：只杀本程序进程，挂起的 `Games.exe` 会被 job 一起带走，而游戏本身继续运行。
 
 **未验证**：国际服 / B 服 / Steam 版；服务端是否另有校验（没有做长时间游玩测试）；
 游戏内更新路径。
