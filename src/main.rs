@@ -34,7 +34,7 @@
 //!
 //! No dependencies; raw `kernel32` / `user32` FFI only.
 
-#![windows_subsystem = "windows"]
+#![cfg_attr(not(test), windows_subsystem = "windows")]
 #![allow(non_snake_case, non_camel_case_types, clippy::upper_case_acronyms)]
 
 use std::ffi::{c_void, OsString};
@@ -70,9 +70,14 @@ const SW_HIDE: u16 = 0;
 const SW_SHOWNORMAL: u16 = 1;
 const CREATE_SUSPENDED: u32 = 0x0000_0004;
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+/// Needed as soon as `lpEnvironment` is a block we built ourselves: without it Windows reads
+/// the block as ANSI and every non-ASCII value (a path, a user name) arrives mangled.
+const CREATE_UNICODE_ENVIRONMENT: u32 = 0x0000_0400;
 const EXTENDED_STARTUPINFO_PRESENT: u32 = 0x0008_0000;
 const PROC_THREAD_ATTRIBUTE_PARENT_PROCESS: usize = 0x0002_0000;
 const INFINITE: u32 = 0xFFFF_FFFF;
+const WAIT_OBJECT_0: u32 = 0;
+const WAIT_FAILED: u32 = 0xFFFF_FFFF;
 const STD_OUTPUT_HANDLE: u32 = -11i32 as u32;
 const MB_OK: u32 = 0x0000_0000;
 const MB_ICONERROR: u32 = 0x0000_0010;
@@ -203,6 +208,7 @@ extern "system" {
     ) -> BOOL;
     fn AssignProcessToJobObject(hJob: HANDLE, hProcess: HANDLE) -> BOOL;
     fn TerminateProcess(hProcess: HANDLE, uExitCode: u32) -> BOOL;
+    fn GetExitCodeProcess(hProcess: HANDLE, lpExitCode: *mut u32) -> BOOL;
     fn WaitForSingleObject(hHandle: HANDLE, dwMilliseconds: u32) -> u32;
     fn CloseHandle(hObject: HANDLE) -> BOOL;
     fn GetLastError() -> u32;
@@ -247,6 +253,121 @@ fn wide_command_line(exe: &Path, args: &str) -> Vec<u16> {
     line
 }
 
+// ---------------------------------------------------------------- per-launch environment
+
+/// The name ReShade's own Vulkan layer manifest declares in `disable_environment`. Setting it
+/// in the `Endfield.exe` environment is what the official installer relies on for its
+/// "disable the overlay for this program" option, so no file in the game directory changes:
+/// the Vulkan loader sees the variable when the game creates its instance and drops the layer
+/// before any of its code runs.
+const RESHADE_DISABLE_ENV: &str = "DISABLE_VK_LAYER_reshade_1";
+
+/// The Vulkan loader's own name filter, used as the second half of `--no-reshade`.
+///
+/// `DISABLE_VK_LAYER_reshade_1` only works because ReShade's layer manifest happens to declare
+/// that name in `disable_environment`; a future ReShade that renames it would silently make the
+/// flag a no-op. `VK_LOADER_LAYERS_DISABLE` is matched by the loader itself against the layer
+/// *name*, so it keeps working no matter what the manifest says. Both are set: the manifest key
+/// is what the ReShade installer documents, the loader filter is the belt to its braces.
+const VK_LOADER_LAYERS_DISABLE_ENV: &str = "VK_LOADER_LAYERS_DISABLE";
+const RESHADE_LAYER_NAME: &str = "VK_LAYER_reshade";
+
+/// Collect `--env NAME=VALUE` pairs (repeatable) and the shorthands that stand for one.
+///
+/// Last one wins for a repeated name, and nothing is applied to this process: the values only
+/// ever reach the game, so `--no-reshade` on one launch cannot disable the layer for the next.
+fn collect_env_overrides(args: &[String]) -> Result<Vec<(String, String)>, String> {
+    let mut overrides: Vec<(String, String)> = Vec::new();
+    let mut index = 0usize;
+    while index < args.len() {
+        let arg = &args[index];
+        let assignment = if arg == "--env" {
+            // A following option is never a value: without this guard `--env --no-reshade`
+            // would fail with a confusing "has no '=' in it" instead of naming the real mistake.
+            let Some(value) = args.get(index + 1).filter(|value| !value.starts_with("--")) else {
+                return Err("--env needs a NAME=VALUE argument (found another option instead)"
+                    .to_string());
+            };
+            index += 2;
+            Some(value.as_str())
+        } else if let Some(rest) = arg.strip_prefix("--env=") {
+            index += 1;
+            Some(rest)
+        } else if arg == "--no-reshade" {
+            index += 1;
+            for (name, value) in [
+                (RESHADE_DISABLE_ENV, "1"),
+                (VK_LOADER_LAYERS_DISABLE_ENV, RESHADE_LAYER_NAME),
+            ] {
+                overrides.retain(|(existing, _)| !existing.eq_ignore_ascii_case(name));
+                overrides.push((name.to_string(), value.to_string()));
+            }
+            continue;
+        } else {
+            index += 1;
+            continue;
+        };
+        let Some(assignment) = assignment else { continue };
+        let Some((name, value)) = assignment.split_once('=') else {
+            return Err(format!(
+                "--env expects NAME=VALUE, but '{assignment}' has no '=' in it"
+            ));
+        };
+        if name.is_empty() {
+            return Err(format!("--env expects a variable name before '=', got '{assignment}'"));
+        }
+        overrides.retain(|(existing, _)| !existing.eq_ignore_ascii_case(name));
+        overrides.push((name.to_string(), value.to_string()));
+    }
+    Ok(overrides)
+}
+
+/// Build the `NAME=VALUE\0…\0\0` block `CreateProcessW` wants, or `None` when nothing is
+/// overridden so the child inherits this process' environment untouched.
+///
+/// Windows requires the block sorted case-insensitively by name and forbids two entries with
+/// the same name, which is why the inherited copy is filtered before the overrides go in: a
+/// stale `DISABLE_VK_LAYER_reshade_1` in this process' own environment must not survive next
+/// to ours.
+fn build_environment_block(overrides: &[(String, String)]) -> Option<Vec<u16>> {
+    if overrides.is_empty() {
+        return None;
+    }
+    let mut entries: Vec<(String, OsString)> = std::env::vars_os()
+        .filter_map(|(key, value)| key.into_string().ok().map(|key| (key, value)))
+        .collect();
+    for (name, value) in overrides {
+        entries.retain(|(key, _)| !key.eq_ignore_ascii_case(name));
+        entries.push((name.clone(), OsString::from(value)));
+    }
+    entries.sort_by_key(|(key, _)| key.to_ascii_uppercase());
+    let mut block: Vec<u16> = Vec::new();
+    for (key, value) in entries {
+        block.extend(OsString::from(format!("{key}=")).encode_wide());
+        block.extend(value.encode_wide());
+        block.push(0);
+    }
+    block.push(0);
+    Some(block)
+}
+
+/// Ceiling for `EndfieldDirectLauncher.log` before it is rotated to `.old`.
+const LOG_ROTATE_BYTES: u64 = 1 << 20;
+
+fn needs_rotation(current_size: u64) -> bool {
+    current_size >= LOG_ROTATE_BYTES
+}
+
+/// Whether a failure should also be raised as a modal message box.
+///
+/// A box is the only way to reach someone who double-clicked the launcher from Explorer, but it is
+/// also the one call that can hang an unattended launch forever: with no interactive desktop it
+/// never returns. So it is shown only when this process has no console output to fall back on, and
+/// `--no-popup` turns it off for scripted launches.
+fn wants_message_box(has_stdout: bool, no_popup: bool) -> bool {
+    !has_stdout && !no_popup
+}
+
 /// The stdout we can write to, if the caller gave us one (a shell pipe) or `--console`
 /// allocated a console. Explorer gives us none.
 fn stdout() -> Option<HANDLE> {
@@ -266,11 +387,16 @@ fn append_to_log_file(line: &str) {
     let Some(dir) = exe.parent() else { return };
     let mut now: SYSTEMTIME = unsafe { std::mem::zeroed() };
     unsafe { GetLocalTime(&mut now) };
-    let Ok(mut file) = fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(dir.join("EndfieldDirectLauncher.log"))
-    else {
+    let path = dir.join("EndfieldDirectLauncher.log");
+    // Append-only with no ceiling grows without bound on a machine that launches the game for
+    // months, and every line opens the file again. One rotation keeps it bounded and still leaves
+    // the previous session available as .old.
+    if fs::metadata(&path).map(|meta| needs_rotation(meta.len())).unwrap_or(false) {
+        let rotated = dir.join("EndfieldDirectLauncher.log.old");
+        let _ = fs::remove_file(&rotated);
+        let _ = fs::rename(&path, &rotated);
+    }
+    let Ok(mut file) = fs::OpenOptions::new().create(true).append(true).open(path) else {
         return;
     };
     let _ = writeln!(
@@ -308,9 +434,11 @@ fn message_box(text: &str, caption: &str, flags: u32) {
     unsafe { MessageBoxW(null_mut(), wide(text).as_ptr(), wide(caption).as_ptr(), flags) };
 }
 
-fn fail(text: String) -> ! {
+fn fail(text: String, show_box: bool) -> ! {
     log(&format!("ERROR: {}", text));
-    message_box(&text, "EndfieldDirectLauncher", MB_OK | MB_ICONERROR);
+    if show_box {
+        message_box(&text, "EndfieldDirectLauncher", MB_OK | MB_ICONERROR);
+    }
     std::process::exit(1);
 }
 
@@ -345,7 +473,7 @@ fn stage_parent_exe(game_dir: &Path) -> Result<PathBuf, String> {
             )
         })?;
 
-    let staging_dir = std::env::temp_dir().join("EndfieldDirectLauncher");
+    let staging_dir = staging_dir();
     fs::create_dir_all(&staging_dir)
         .map_err(|e| format!("Could not create {}:\n{}", staging_dir.display(), e))?;
     let staged = staging_dir.join("Games.exe");
@@ -369,17 +497,42 @@ fn stage_parent_exe(game_dir: &Path) -> Result<PathBuf, String> {
     Ok(staged)
 }
 
-/// Drop the staged copy once the placeholder is gone. A leftover would be harmless (the next
-/// run overwrites it) but pointless. Windows releases a terminated process' image section a
-/// moment after the fact, so a few retries are needed before the file will actually go.
+/// Root under which every run gets its own directory.
+fn staging_root() -> PathBuf {
+    std::env::temp_dir().join("EndfieldDirectLauncher")
+}
+
+/// Directory for *this* run's stand-in parent.
+///
+/// It used to be one fixed path shared by every launch, which made two runs collide: a placeholder
+/// left behind by a killed launcher (or a second launch started before the first one had cleaned
+/// up) still held `Games.exe` open, and the next `fs::copy` failed with "Could not copy ...
+/// The process cannot access the file because it is being used by another process. (os error 32)".
+/// The launch check only looks at the file *name* and its signature, so the file can live
+/// anywhere - giving each run its own directory removes the collision without touching the game
+/// directory.
+fn staging_dir() -> PathBuf {
+    staging_root().join(std::process::id().to_string())
+}
+
+/// Drop the staged copy once the placeholder is gone. Windows releases a terminated process image
+/// section a moment after the fact, so a few retries are needed before the file will actually go.
 fn remove_staged_parent(path: &Path) {
     for attempt in 0..10 {
         match fs::remove_file(path) {
             Ok(()) => {
                 log(&format!("removed {}", path.display()));
+                if let Some(dir) = path.parent() {
+                    let _ = fs::remove_dir(dir);
+                }
                 return;
             }
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                if let Some(dir) = path.parent() {
+                    let _ = fs::remove_dir(dir);
+                }
+                return;
+            }
             Err(error) => {
                 if attempt == 9 {
                     log(&format!("could not remove {}: {}", path.display(), error));
@@ -484,7 +637,16 @@ fn kill_placeholder_with_us(process: HANDLE) {
 }
 
 /// Start `Endfield.exe` with `parent` as its reported parent process.
-fn start_game(game_exe: &Path, game_dir: &Path, parent: HANDLE) -> Result<Child, String> {
+///
+/// `environment` is the block from [`build_environment_block`]; it is only ever passed when the
+/// caller asked for overrides, so an ordinary launch keeps handing the child `NULL` and thereby
+/// this process' exact environment.
+fn start_game(
+    game_exe: &Path,
+    game_dir: &Path,
+    parent: HANDLE,
+    environment: Option<&mut Vec<u16>>,
+) -> Result<Child, String> {
     let mut list_size = 0usize;
     unsafe { InitializeProcThreadAttributeList(null_mut(), 1, 0, &mut list_size) };
     let align = std::mem::size_of::<usize>();
@@ -526,6 +688,14 @@ fn start_game(game_exe: &Path, game_dir: &Path, parent: HANDLE) -> Result<Child,
     startup.StartupInfo.wShowWindow = SW_SHOWNORMAL;
     startup.lpAttributeList = attribute_list;
 
+    let (environment_pointer, environment_flags) = match environment {
+        Some(block) => (
+            block.as_mut_ptr() as *mut c_void,
+            CREATE_UNICODE_ENVIRONMENT,
+        ),
+        None => (null_mut(), 0u32),
+    };
+
     let mut info: PROCESS_INFORMATION = unsafe { std::mem::zeroed() };
     let ok = unsafe {
         CreateProcessW(
@@ -534,8 +704,8 @@ fn start_game(game_exe: &Path, game_dir: &Path, parent: HANDLE) -> Result<Child,
             null_mut(),
             null_mut(),
             0,
-            EXTENDED_STARTUPINFO_PRESENT,
-            null_mut(),
+            EXTENDED_STARTUPINFO_PRESENT | environment_flags,
+            environment_pointer,
             cwd.as_ptr(),
             &mut startup,
             &mut info,
@@ -574,22 +744,63 @@ fn clear_steam_appid_hint(game_dir: &Path) {
     }
 }
 
+/// Log text for the end of a launch.
+///
+/// Pure on purpose: printing "exited with code 0" after a failed wait is exactly the quiet lie
+/// this tool cannot afford, because the log file is the only record an elevated launch leaves
+/// behind.
+fn describe_exit(wait_result: u32, exit_code: Option<u32>) -> String {
+    match (wait_result, exit_code) {
+        (WAIT_OBJECT_0, Some(code)) => format!("game exited with code {code} (0x{code:08X})"),
+        (WAIT_OBJECT_0, None) => {
+            "game exited, but GetExitCodeProcess failed; the exit code is unknown".to_string()
+        }
+        (WAIT_FAILED, _) => "waiting for the game failed (WAIT_FAILED); it may still be running"
+            .to_string(),
+        (other, _) => format!("stopped waiting on the game with result 0x{other:08X}"),
+    }
+}
+
 // ---------------------------------------------------------------- entry point
 
+/// Value of `--name VALUE` or `--name=VALUE`, with the last occurrence winning - the same rule
+/// `--env` follows, so `--game-dir A --game-dir B` cannot silently mean `A`.
+///
+/// A following token that starts with `--` counts as another option rather than a value, so
+/// `--game-dir --no-reshade` is rejected instead of looking for a directory named "--no-reshade".
 fn arg_value(args: &[String], name: &str) -> Option<String> {
-    let index = args.iter().position(|a| a == name)?;
-    args.get(index + 1).cloned()
+    let with_equals = format!("{name}=");
+    let mut found: Option<String> = None;
+    for (index, arg) in args.iter().enumerate() {
+        if let Some(value) = arg.strip_prefix(&with_equals) {
+            found = Some(value.to_string());
+        } else if arg == name {
+            if let Some(value) = args.get(index + 1).filter(|value| !value.starts_with("--")) {
+                found = Some(value.clone());
+            }
+        }
+    }
+    found
 }
 
 fn help_text() -> String {
-    "\
-EndfieldDirectLauncher — starts Endfield.exe without the official launcher UI.
+    format!(
+        "\
+EndfieldDirectLauncher {} — starts Endfield.exe without the official launcher UI.
 
 Run it from the game directory (the folder holding Endfield.exe).
 
 Options:
   --console                 attach a console window for progress/errors
-  --game-dir <dir>          directory containing Endfield.exe (default: this exe's folder)
+  --game-dir <dir>          directory containing Endfield.exe (default: this exe folder);
+                            --game-dir=<dir> is accepted too, last one wins
+  --no-reshade              start the game without ReShade: sets DISABLE_VK_LAYER_reshade_1=1
+                            and VK_LOADER_LAYERS_DISABLE=VK_LAYER_reshade in the game's
+                            environment, so ReShade and anything loaded through it (DLSS 5
+                            add-ons) never load in this run
+  --env NAME=VALUE          add or replace one variable in the game's environment (repeatable)
+  --dry-run                 report the command line and environment, start nothing
+  --no-popup                never open a message box; write errors to the log file only
   --help                    show this text
 
 How it works:
@@ -597,8 +808,22 @@ How it works:
   carry the publisher's signature. This tool copies a signed executable out of the game
   directory to a temporary Games.exe, starts it suspended, and creates Endfield.exe with
   PROC_THREAD_ATTRIBUTE_PARENT_PROCESS pointing at it, so both checks pass while no code
-  of that binary ever runs."
-        .to_string()
+  of that binary ever runs.",
+        env!("CARGO_PKG_VERSION")
+    )
+}
+
+/// First line of every log: which build is actually running.
+///
+/// Not decoration. The flag that "did nothing" once turned out to be a months-old binary still
+/// sitting in the game directory, and `strings` on the deployed file was the only way to notice;
+/// a version in the log makes the next such mismatch visible from the log alone.
+fn version_line() -> String {
+    format!(
+        "launcher  : {} {}",
+        env!("CARGO_PKG_NAME"),
+        env!("CARGO_PKG_VERSION")
+    )
 }
 
 fn run(args: &[String]) -> Result<(), String> {
@@ -606,6 +831,11 @@ fn run(args: &[String]) -> Result<(), String> {
         Some(dir) => PathBuf::from(dir),
         None => exe_dir(),
     };
+    log(&version_line());
+    // Recorded before the directory is validated: a launch moved to a shell, a Steam shortcut or
+    // the Windows Run box is told apart here, and a wrong directory needs this line as much as a
+    // correct one does.
+    log(&format!("arguments : {args:?}"));
     let game_exe = game_dir.join("Endfield.exe");
     if !game_exe.is_file() {
         return Err(format!(
@@ -615,6 +845,25 @@ fn run(args: &[String]) -> Result<(), String> {
         ));
     }
     log(&format!("game exe  : {}", game_exe.display()));
+
+    let env_overrides = collect_env_overrides(args)?;
+    let dry_run = args.iter().any(|a| a == "--dry-run");
+    for (name, value) in &env_overrides {
+        log(&format!("env override: {name}={value}"));
+    }
+    if dry_run {
+        log(&format!(
+            "dry run   : would start \"{}\" {}",
+            game_exe.display(),
+            LAUNCHER_ARGS
+        ));
+        log(&format!("dry run   : working directory {}", game_dir.display()));
+        log(&format!(
+            "dry run   : {} overridden variable(s) in the game process environment",
+            env_overrides.len()
+        ));
+        return Ok(());
+    }
 
     let parent_exe = stage_parent_exe(&game_dir)?;
     let mut parent = match start_suspended_pseudoparent(&parent_exe) {
@@ -628,10 +877,19 @@ fn run(args: &[String]) -> Result<(), String> {
     // the job of the parent named in `PROC_THREAD_ATTRIBUTE_PARENT_PROCESS`, so assigning the
     // placeholder to the job any earlier would put the game in it as well — and then killing
     // this program would kill the game, which is the opposite of what the job is for.
-    let mut game = match start_game(&game_exe, &game_dir, parent.process) {
+    let mut environment_block = build_environment_block(&env_overrides);
+    let mut game = match start_game(
+        &game_exe,
+        &game_dir,
+        parent.process,
+        environment_block.as_mut(),
+    ) {
         Ok(child) => child,
         Err(error) => {
-            unsafe { TerminateProcess(parent.process, 0) };
+            unsafe {
+                TerminateProcess(parent.process, 0);
+                parent.close();
+            }
             remove_staged_parent(&parent_exe);
             return Err(error);
         }
@@ -643,8 +901,10 @@ fn run(args: &[String]) -> Result<(), String> {
          launch check sees games.exe",
         game.pid
     ));
+    let mut exit_code = 0u32;
+    let wait_result = unsafe { WaitForSingleObject(game.process, INFINITE) };
+    let exit_code_read = unsafe { GetExitCodeProcess(game.process, &mut exit_code) } != 0;
     unsafe {
-        WaitForSingleObject(game.process, INFINITE);
         // Nothing of that binary ever ran; drop the placeholder once the game is gone.
         TerminateProcess(parent.process, 0);
         game.close();
@@ -652,7 +912,10 @@ fn run(args: &[String]) -> Result<(), String> {
     }
     clear_steam_appid_hint(&game_dir);
     remove_staged_parent(&parent_exe);
-    log("game exited");
+    log(&describe_exit(
+        wait_result,
+        if exit_code_read { Some(exit_code) } else { None },
+    ));
     Ok(())
 }
 
@@ -663,10 +926,13 @@ fn main() {
         unsafe { AllocConsole() };
     }
 
+    let show_box = |no_popup: bool| wants_message_box(stdout().is_some(), no_popup);
+    let no_popup = args.iter().any(|a| a == "--no-popup");
+
     if args.iter().any(|a| a == "--help" || a == "-h") {
         let text = help_text();
         log(&text);
-        if stdout().is_none() {
+        if show_box(no_popup) {
             message_box(&text, "EndfieldDirectLauncher", MB_OK | MB_ICONINFORMATION);
         }
         return;
@@ -674,6 +940,234 @@ fn main() {
 
     match run(&args) {
         Ok(()) => {}
-        Err(error) => fail(error),
+        Err(error) => fail(error, show_box(no_popup)),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn args(items: &[&str]) -> Vec<String> {
+        items.iter().map(|item| item.to_string()).collect()
+    }
+
+    fn value_of<'a>(overrides: &'a [(String, String)], name: &str) -> Option<&'a str> {
+        overrides
+            .iter()
+            .find(|(key, _)| key.eq_ignore_ascii_case(name))
+            .map(|(_, value)| value.as_str())
+    }
+
+    fn count_of(overrides: &[(String, String)], name: &str) -> usize {
+        overrides
+            .iter()
+            .filter(|(key, _)| key.eq_ignore_ascii_case(name))
+            .count()
+    }
+
+    /// Split a `NAME=VALUE\\0...\\0\\0` block back into entries.
+    fn entries(block: &[u16]) -> Vec<String> {
+        let mut out = Vec::new();
+        let mut current = String::new();
+        for &unit in block {
+            if unit == 0 {
+                if current.is_empty() {
+                    break;
+                }
+                out.push(current.clone());
+                current.clear();
+            } else {
+                current.push(std::char::from_u32(u32::from(unit)).unwrap_or('?'));
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn the_log_names_the_running_build() {
+        assert!(version_line().contains(env!("CARGO_PKG_VERSION")));
+        assert!(version_line().starts_with("launcher"));
+    }
+
+    #[test]
+    fn help_names_the_version() {
+        let text = help_text();
+        assert!(text.contains(env!("CARGO_PKG_VERSION")), "help lost the version");
+        assert!(text.contains("--no-popup") && text.contains("--no-reshade"));
+    }
+
+    #[test]
+    fn no_reshade_sets_both_switches() {
+        let overrides = collect_env_overrides(&args(&["--no-reshade"])).unwrap();
+        assert_eq!(overrides.len(), 2);
+        assert_eq!(value_of(&overrides, RESHADE_DISABLE_ENV), Some("1"));
+        assert_eq!(value_of(&overrides, VK_LOADER_LAYERS_DISABLE_ENV), Some(RESHADE_LAYER_NAME));
+    }
+
+    #[test]
+    fn no_reshade_twice_stays_two_entries() {
+        let overrides = collect_env_overrides(&args(&["--no-reshade", "--no-reshade"])).unwrap();
+        assert_eq!(overrides.len(), 2);
+        assert_eq!(count_of(&overrides, RESHADE_DISABLE_ENV), 1);
+    }
+
+    #[test]
+    fn a_later_env_replaces_the_shorthand() {
+        let overrides = collect_env_overrides(&args(&[
+            "--no-reshade",
+            "--env",
+            "DISABLE_VK_LAYER_reshade_1=0",
+        ]))
+        .unwrap();
+        assert_eq!(value_of(&overrides, RESHADE_DISABLE_ENV), Some("0"));
+        assert_eq!(count_of(&overrides, RESHADE_DISABLE_ENV), 1);
+        assert_eq!(value_of(&overrides, VK_LOADER_LAYERS_DISABLE_ENV), Some(RESHADE_LAYER_NAME));
+    }
+
+    #[test]
+    fn env_requires_a_value() {
+        assert!(collect_env_overrides(&args(&["--env"])).is_err());
+    }
+
+    #[test]
+    fn env_does_not_take_an_option_as_its_value() {
+        // Reverting the guard turns this into Ok([]) or an "has no '=' in it" error; either way the
+        // assertion below fails, so the guard is the thing under test.
+        let error = collect_env_overrides(&args(&["--env", "--no-reshade"])).unwrap_err();
+        assert!(
+            error.contains("found another option"),
+            "the option was taken as a value; it must be named as such: {error}"
+        );
+    }
+
+    #[test]
+    fn env_accepts_both_spellings() {
+        let spaced = collect_env_overrides(&args(&["--env", "FMT=1"])).unwrap();
+        let joined = collect_env_overrides(&args(&["--env=FMT=1"])).unwrap();
+        assert_eq!(spaced, joined);
+        assert_eq!(value_of(&spaced, "FMT"), Some("1"));
+    }
+
+    #[test]
+    fn env_rejects_assignments_without_equals_or_name() {
+        assert!(collect_env_overrides(&args(&["--env", "NOEQUALS"])).is_err());
+        assert!(collect_env_overrides(&args(&["--env", "=value-but-no-name"])).is_err());
+    }
+
+    #[test]
+    fn the_last_assignment_wins() {
+        let overrides = collect_env_overrides(&args(&[
+            "--env",
+            "FMT=1",
+            "--env",
+            "OTHER=x",
+            "--env",
+            "FMT=2",
+        ]))
+        .unwrap();
+        assert_eq!(value_of(&overrides, "FMT"), Some("2"));
+        assert_eq!(count_of(&overrides, "FMT"), 1);
+        assert_eq!(value_of(&overrides, "OTHER"), Some("x"));
+    }
+
+    #[test]
+    fn environment_block_is_none_without_overrides() {
+        assert!(build_environment_block(&[]).is_none());
+    }
+
+    #[test]
+    fn environment_block_is_sorted_and_double_nul_terminated() {
+        let block = build_environment_block(&[("zz_test_sorted".to_string(), "1".to_string())])
+            .unwrap();
+        assert_eq!(block[block.len() - 1], 0);
+        assert_eq!(block[block.len() - 2], 0);
+        let names: Vec<String> = entries(&block)
+            .iter()
+            .map(|entry| {
+                entry
+                    .split_once('=')
+                    .map(|(key, _)| key.to_ascii_uppercase())
+                    .unwrap_or_else(|| entry.to_ascii_uppercase())
+            })
+            .collect();
+        assert!(names.windows(2).all(|pair| pair[0] <= pair[1]), "not sorted: {names:?}");
+    }
+
+    #[test]
+    fn environment_block_keeps_one_entry_per_name() {
+        let block = build_environment_block(&[
+            ("zz_test_dup".to_string(), "1".to_string()),
+            ("ZZ_TEST_DUP".to_string(), "2".to_string()),
+        ])
+        .unwrap();
+        let hits: Vec<String> = entries(&block)
+            .into_iter()
+            .filter(|entry| entry.to_ascii_uppercase().starts_with("ZZ_TEST_DUP="))
+            .collect();
+        assert_eq!(hits.len(), 1, "duplicate survived: {hits:?}");
+        assert_eq!(hits[0], "ZZ_TEST_DUP=2");
+    }
+
+    #[test]
+    fn a_one_megabyte_block_still_ends_with_two_zeros() {
+        let block = build_environment_block(&[("zz_test_tail".to_string(), String::new())]).unwrap();
+        assert_eq!(&block[block.len() - 2..], &[0, 0]);
+    }
+
+    #[test]
+    fn game_dir_accepts_both_spellings_and_last_wins() {
+        assert_eq!(arg_value(&args(&["--game-dir", "A"]), "--game-dir").as_deref(), Some("A"));
+        assert_eq!(arg_value(&args(&["--game-dir=B"]), "--game-dir").as_deref(), Some("B"));
+        assert_eq!(
+            arg_value(&args(&["--game-dir", "A", "--game-dir=B"]), "--game-dir").as_deref(),
+            Some("B")
+        );
+        assert_eq!(
+            arg_value(&args(&["--game-dir=B", "--game-dir", "A"]), "--game-dir").as_deref(),
+            Some("A")
+        );
+    }
+
+    #[test]
+    fn game_dir_does_not_take_an_option_as_its_value() {
+        assert_eq!(arg_value(&args(&["--game-dir", "--no-reshade"]), "--game-dir"), None);
+    }
+
+    #[test]
+    fn staging_directory_belongs_to_this_process() {
+        let dir = staging_dir();
+        assert_eq!(dir.parent(), Some(staging_root().as_path()));
+        assert_eq!(
+            dir.file_name().unwrap().to_string_lossy(),
+            std::process::id().to_string()
+        );
+        assert_ne!(dir, staging_root().join("Games.exe"));
+    }
+
+    #[test]
+    fn message_box_needs_neither_console_nor_flag() {
+        assert!(wants_message_box(false, false));
+        assert!(!wants_message_box(true, false));
+        assert!(!wants_message_box(false, true));
+        assert!(!wants_message_box(true, true));
+    }
+
+    #[test]
+    fn log_rotates_at_the_ceiling() {
+        assert!(!needs_rotation(LOG_ROTATE_BYTES - 1));
+        assert!(needs_rotation(LOG_ROTATE_BYTES));
+        assert!(needs_rotation(LOG_ROTATE_BYTES * 3));
+    }
+
+    #[test]
+    fn exit_report_never_invents_a_code() {
+        assert_eq!(
+            describe_exit(WAIT_OBJECT_0, Some(0)),
+            "game exited with code 0 (0x00000000)"
+        );
+        assert!(describe_exit(WAIT_OBJECT_0, None).contains("unknown"));
+        assert!(describe_exit(WAIT_FAILED, Some(3)).contains("WAIT_FAILED"));
+        assert!(describe_exit(0x102, None).contains("0x00000102"));
     }
 }

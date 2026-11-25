@@ -29,8 +29,9 @@ failed` 并提示「请用官方启动器启动」：
 > `LoadLibraryExA` + `GetProcAddress` 动态取，所以只翻导入表会把它误判成「只比名字」。
 
 本程序不改动游戏本体。它把游戏目录里一个**带发行商签名**的 exe（默认 `PlatformProcess.exe`）
-复制到 `%TEMP%\EndfieldDirectLauncher\Games.exe`，让这份副本充当父进程——检查只看名字和签名，
-不看路径，所以副本放临时目录一样通过，**因此完全不需要安装官方启动器**：
+复制到 `%TEMP%\EndfieldDirectLauncher\<本次运行的 PID>\Games.exe`，让这份副本充当父进程——检查只看名字和签名，
+不看路径，所以副本放临时目录一样通过，**因此完全不需要安装官方启动器**。每次运行各用一个子目录，
+是为了让上一次被强杀留下的副本（Windows 要过一会儿才放开映像节）不会挡住这一次的复制：
 
 1. 复制那份签名的 exe 成临时文件 `Games.exe`，以 `CREATE_SUSPENDED` 拉起——它存在，但一条指令
    都不会执行。
@@ -59,58 +60,129 @@ failed` 并提示「请用官方启动器启动」：
 
 ## 如何使用
 
-### 1. 放好文件
+### 1. 把 exe 放进游戏目录
 
-把 `EndfieldDirectLauncher.exe` 放到游戏目录，也就是 `Endfield.exe` 那一层：
+放在 `Endfield.exe` 同一层就行，不用装鹰角启动器：
 
 ```
-F:\Hypergryph Launcher\games\Endfield Game\
+F:\Hypergryph Launcher\games\Arknights Endfield\
 ├─ Endfield.exe
 ├─ EndfieldDirectLauncher.exe   ← 放这里
 └─ ...
 ```
 
-文件从本仓库 Releases 下载，或自行构建（见第 5 节）。
+文件从本仓库 Releases 下载，或者自己编译（见第 6 节）。
 
 ### 2. 双击启动
 
-双击即可，首次会请求管理员权限（原因见 FAQ）。游戏退出后本程序自动退出。
+双击，第一次会问管理员权限，点「是」。之后本程序在后台等游戏退出，游戏一关它自己也关。
 
-> [!NOTE]
-> 游戏内更新仍然要走官方启动器。客户端版本落后时，先正常启动一次官方启动器完成更新，
-> 之后继续用本程序。
+游戏内更新还是要走官方启动器：版本落后时先正常开一次官方启动器更新完，再回来用这个。
 
-### 3. 加进 Steam 库（可选）
+### 3. 加进 Steam（可选）
 
-1. Steam →「添加非 Steam 游戏」→ 选中游戏目录里的 `EndfieldDirectLauncher.exe`。
-2. 启动后库条目会一直显示「运行中」，直到游戏退出。
-3. 若库里只闪一下就没了，删掉（或改名）游戏目录里的 `steam_appid.txt`，详见 FAQ。
+1. Steam →「添加非 Steam 游戏」→ 选游戏目录里的 `EndfieldDirectLauncher.exe`。
+2. 从库里启动，条目会一直显示「运行中」，直到游戏退出。
+3. 要是只闪一下就没了，看下面 FAQ 里 `steam_appid.txt` 那一条。
 
-### 4. 命令行参数
+### 4. 参数一览
+
+大多数情况**不用写任何参数**，双击就够了。要加参数，可以接在快捷方式「属性 → 目标」后面，
+也可以直接在命令行里写，多个参数可以一起用，例如 `EndfieldDirectLauncher.exe --console --no-reshade`。
+
+| 参数 | 干什么 |
+| --- | --- |
+| `--console` | 多开一个控制台窗口，边跑边显示每一步在干什么。平时不用。 |
+| `--game-dir <目录>` | 告诉它游戏在哪。exe 不在游戏目录里时才需要。 |
+| `--no-reshade` | 这次启动不带 ReShade，连带装在 ReShade 里的 DLSS 5 插件也不加载。 |
+| `--env NAME=VALUE` | 给游戏进程加一条或改一条环境变量，可以写多次。 |
+| `--dry-run` | 只打印「准备用什么命令行和环境变量启动」，游戏不启动。 |
+| `--no-popup` | 出错也不弹框，只写日志。给脚本和计划任务用。 |
+| `--help` / `-h` | 打印帮助（开头带版本号）。 |
+
+逐个说明：
+
+**`--console`**
+
+多开一个黑色控制台窗口，本程序每做一步都在里面打一行。想看着它到底干了什么时才加，平时不用。
+
+**`--game-dir <目录>`**
+
+指定 `Endfield.exe` 所在的目录。只有在 exe 不在游戏目录里、或者你想给别的区的客户端启动时才要写。
+
+`--game-dir "D:\game"` 和 `--game-dir="D:\game"` 两种写法都行，目录里有空格就加引号。
+
+**`--no-reshade`**
+
+这一次启动不带 ReShade，装在 ReShade 里的 DLSS 5 那三个插件也一起不加载。
+
+它只给游戏进程加两条环境变量，不删文件、不改注册表、不动游戏目录，所以下次不带这个参数启动就自动恢复：
+
+- `DISABLE_VK_LAYER_reshade_1=1` —— ReShade 自己声明的开关；
+- `VK_LOADER_LAYERS_DISABLE=VK_LAYER_reshade` —— Vulkan loader 按层名过滤，将来 ReShade 改了变量名这条也还管用。
+
+只想关掉 ReShade 里的某几个插件、而保留 ReShade 本身，得去改 `ReShade.ini` 的 `[ADDON]` 段。
+那个文件 ReShade 退出时会重写，所以本工具不代写。
+
+**`--env NAME=VALUE`**
+
+给游戏进程加一条或改一条环境变量，可以写多次，例如 `--env FMT=1 --env LC_ALL=zh_CN.UTF-8`。
+同样的名字写两次，以最后一次为准。`--env NAME=VALUE` 和 `--env=NAME=VALUE` 都认。
+
+只想临时改而不想留痕迹时用它比改系统环境变量干净：只影响这一次启动的游戏进程。
+
+**`--dry-run`**
+
+只打印准备执行的命令行和环境变量，游戏不启动。排查「参数到底有没有生效」时先跑这个。
+
+**`--no-popup`**
+
+出错也不弹消息框，只写日志。给脚本、计划任务、远程/无人值守启动用——没人去点「确定」时，
+弹出的框会把进程一直挂在那儿。
+
+**`--help`**（也可以写 `-h`）
+
+打印上面这些说明，第一行带版本号，可以用来确认手上这份 exe 是新是旧。
+
+几条通用规则：
+
+- 同一个参数写多次，**最后一次生效**；
+- `--game-dir` 或 `--env` 后面紧跟另一个 `--参数` 时，会被判成「漏了值」并直接报错，不会把那个参数当成值；
+- 出错默认弹消息框（双击启动时这是唯一能看到错误的地方）；从命令行启动或者加了 `--console` 时只写控制台和日志；
+  加了 `--no-popup` 则一律不弹。
+
+### 5. 出问题先看日志
+
+每次运行都会往 exe 同目录的 `EndfieldDirectLauncher.log` 追加记录。开头两行最有用：
 
 ```
-EndfieldDirectLauncher.exe                      # 游戏目录下双击即可
-EndfieldDirectLauncher.exe --console            # 附带控制台窗口，看进度
-EndfieldDirectLauncher.exe --game-dir <目录>    # 指定 Endfield.exe 所在目录
-EndfieldDirectLauncher.exe --help
+launcher  : endfield-direct-launcher <版本>
+arguments : ["--no-reshade"]
 ```
 
-错误一律用消息框弹出。
+- 第一行是版本：确认游戏目录里跑的是不是最新那份 exe；
+- 第二行是这次**真正收到**的参数：这一行里没有，就说明是快捷方式/脚本那一层没把参数送进来。
 
-### 5. 从源码构建
+日志超过 1 MiB 会轮转：当前文件改名成 `EndfieldDirectLauncher.log.old`（旧的 `.old` 先删掉），新文件从头写。
+
+### 6. 自己编译（可选）
 
 ```
 cargo build --release
 ```
 
-产物为 `target\release\EndfieldDirectLauncher.exe`。构建时会调用 Windows SDK 的 `rc.exe`
-把 `assets\app.ico` 编成资源嵌进 exe；若 `rc.exe` 不在 PATH 也不在 SDK 默认位置，
-设置环境变量 `RC` 指向它即可。
+产物是 `target\release\EndfieldDirectLauncher.exe`。构建时要用 Windows SDK 的 `rc.exe` 把
+`assets\app.ico` 编成资源嵌进 exe；`rc.exe` 既不在 PATH 也不在 SDK 默认位置时，设环境变量 `RC` 指过去。
 
-### 6. 出问题看日志
+跑单元测试：
 
-每次运行的完整轨迹（含父进程、PID、启动检查结果）追加写在 exe 同目录的
-`EndfieldDirectLauncher.log`。
+```
+EFDL_TEST_NO_MANIFEST=1 cargo test
+```
+
+exe 清单里写着 `requireAdministrator`，而 `cargo test` 是从普通权限的 shell 拉起测试二进制的，
+不关掉清单就会在第一条断言之前以 os error 740 失败。这个环境变量只影响这一次构建，
+正常 `cargo build` 仍然带管理员清单。
 
 ## 常见问题
 
@@ -132,7 +204,7 @@ Win32 **740** `ERROR_ELEVATION_REQUIRED` 失败）。本程序同样在清单里
 
 ### 会修改游戏文件吗？有封号风险吗？
 
-不改游戏本体。程序只**读出**一个带签名的 exe 复制到 `%TEMP%\EndfieldDirectLauncher\`，
+不改游戏本体。程序只**读出**一个带签名的 exe 复制到 `%TEMP%\EndfieldDirectLauncher\<PID>\`，
 不写游戏目录里的任何 exe、dll 或游戏数据；也不打开游戏进程句柄、不按进程名扫描
 （游戏启动期间按进程名检查有触发 ACE 的风险，因此这里只等待句柄）。
 
@@ -145,7 +217,7 @@ Win32 **740** `ERROR_ELEVATION_REQUIRED` 失败）。本程序同样在清单里
 
 从游戏目录里挑一个带发行商签名的 exe，默认 `PlatformProcess.exe`，依次退到
 `QtWebEngineProcess.exe`、`UnityCrashHandler64.exe`，复制成
-`%TEMP%\EndfieldDirectLauncher\Games.exe` 再挂起。
+`%TEMP%\EndfieldDirectLauncher\<本次运行的 PID>\Games.exe` 再挂起。
 
 这样做的原因：检查只认「名字 + 发行商签名」，而游戏目录里的这些文件本来就由该区服的发行商
 签名（国服是 Shanghai Hypergryph），所以哪个区服就用哪个区服的签名——不必去找官方启动器
@@ -202,6 +274,19 @@ Sat Oct 17 17:59:50 2026 UTC - GameOverlayRenderer.dll detaching
 未验证。父进程用的是游戏目录自己的签名文件，所以签名天然是那个区服的，理论上同样可用；
 据社区反馈国际服（GRYPHLINK）本来就不做这项检查。本机只验证过国服 1.6.0 客户端。
 
+### 参数明明加了却没生效？
+
+先看游戏目录里那份 `EndfieldDirectLauncher.log` 的头两行：
+
+```
+launcher  : endfield-direct-launcher <版本>
+arguments : ["--no-reshade"]
+```
+
+`arguments` 里没有这个参数，说明传参的那一层（快捷方式「启动选项」、脚本、计划任务）没把它送到
+本程序；有参数却没效果，先比 `launcher` 那一行的版本号与这份 exe 的构建是否一致——更新过仓库却
+忘了把新 exe 复制进游戏目录时，旧版本会把这个参数当未知参数直接忽略，表现就和「参数不管用」一模一样。
+
 ### 游戏更新怎么办？
 
 绕过启动器意味着不走更新流程。发现版本落后时，用官方启动器正常启动一次完成更新，
@@ -235,7 +320,7 @@ Sat Oct 17 17:59:50 2026 UTC - GameOverlayRenderer.dll detaching
 
 现在的默认路径同样留了读数：`OneChannelLC.log` 里是
 `Parent process check success:…` + `{"code":2003,"msg":{"code":0,"msg":{"filePath":
-"c:\\users\\…\\temp\\endfielddirectlauncher\\games.exe"}}}`——通过，且父进程路径确实是临时副本。
+"c:\\users\\…\\temp\\endfielddirectlauncher\\<pid>\\games.exe"}}}`——通过，且父进程路径确实是临时副本。
 另外单独验过收尾：只杀本程序进程，挂起的 `Games.exe` 会被 job 一起带走，而游戏本身继续运行。
 
 **未验证**：国际服 / B 服 / Steam 版；服务端是否另有校验（没有做长时间游玩测试）；

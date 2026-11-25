@@ -15,10 +15,16 @@ use std::path::PathBuf;
 use std::process::Command;
 
 fn main() {
-    // Both switches are needed: this toolchain emits no manifest resource at all unless
-    // embedding is asked for explicitly.
-    println!("cargo:rustc-link-arg=/MANIFEST:EMBED");
-    println!("cargo:rustc-link-arg=/MANIFESTUAC:level='requireAdministrator'");
+    // Tests cannot run inside a binary that demands elevation: the harness is spawned by cargo
+    // from a standard-user token and dies with os error 740 before a single assertion runs.
+    // `cargo test` therefore clears the requirement through this switch; a normal build keeps it.
+    println!("cargo:rerun-if-env-changed=EFDL_TEST_NO_MANIFEST");
+    if env::var_os("EFDL_TEST_NO_MANIFEST").is_none() {
+        // Both switches are needed: this toolchain emits no manifest resource at all unless
+        // embedding is asked for explicitly.
+        println!("cargo:rustc-link-arg=/MANIFEST:EMBED");
+        println!("cargo:rustc-link-arg=/MANIFESTUAC:level='requireAdministrator'");
+    }
     embed_icon();
 }
 
