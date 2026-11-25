@@ -1171,3 +1171,6 @@ mod tests {
         assert!(describe_exit(0x102, None).contains("0x00000102"));
     }
 }
+
+#[cfg(test)]
+mod readme_contract;
