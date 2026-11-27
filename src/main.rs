@@ -646,6 +646,7 @@ fn start_game(
     game_dir: &Path,
     parent: HANDLE,
     environment: Option<&mut Vec<u16>>,
+    game_args: &str,
 ) -> Result<Child, String> {
     let mut list_size = 0usize;
     unsafe { InitializeProcThreadAttributeList(null_mut(), 1, 0, &mut list_size) };
@@ -679,7 +680,7 @@ fn start_game(
     }
 
     let application = wide_path(game_exe);
-    let mut command_line = wide_command_line(game_exe, LAUNCHER_ARGS);
+    let mut command_line = wide_command_line(game_exe, game_args);
     let cwd = wide_path(game_dir);
 
     let mut startup: STARTUPINFOEXW = unsafe { std::mem::zeroed() };
@@ -783,6 +784,43 @@ fn arg_value(args: &[String], name: &str) -> Option<String> {
     found
 }
 
+/// Options that consume the token after them, so their value is never mistaken for a game
+/// switch.
+const OPTIONS_WITH_VALUE: [&str; 2] = ["--game-dir", "--env"];
+
+/// Everything this tool does not recognise, joined for the game's command line.
+///
+/// This is what makes `-force-d3d11` usable: a game's renderer switches are single-dash and are
+/// not this tool's business to enumerate, so anything that is not one of the options above is
+/// handed to Endfield.exe verbatim. Recognised options, and the values they consume, are dropped:
+/// forwarding `--no-reshade` would only confuse the game, and forwarding the value of `--game-dir`
+/// would launch it with a stray path.
+fn forwarded_args(args: &[String]) -> String {
+    let mut forwarded: Vec<&str> = Vec::new();
+    let mut index = 0;
+    while index < args.len() {
+        let arg = args[index].as_str();
+        let name = arg.split('=').next().unwrap_or(arg);
+        if OPTIONS_WITH_VALUE.contains(&name) {
+            // `--name=value` carries its own value; `--name value` takes the next token unless
+            // that token is another option, which is the rule `arg_value` already follows.
+            let takes_next = !arg.contains('=')
+                && args
+                    .get(index + 1)
+                    .is_some_and(|value| !value.starts_with("--"));
+            if takes_next {
+                index += 1;
+            }
+        } else if arg.starts_with("--") || arg == "-h" {
+            // An option of ours: consumed here, never handed on.
+        } else {
+            forwarded.push(arg);
+        }
+        index += 1;
+    }
+    forwarded.join(" ")
+}
+
 fn help_text() -> String {
     format!(
         "\
@@ -802,6 +840,10 @@ Options:
   --dry-run                 report the command line and environment, start nothing
   --no-popup                never open a message box; write errors to the log file only
   --help                    show this text
+  <anything else>           passed to the game verbatim, after the two launcher switches this
+                            tool always sends: a switch it does not recognise reaches
+                            Endfield.exe exactly as typed here, which is how -force-d3d11,
+                            -force-vulkan or -windowed get in
 
 How it works:
   The game's OneChannelLC.dll requires its parent process to be named Games.exe and to
@@ -848,6 +890,17 @@ fn run(args: &[String]) -> Result<(), String> {
 
     let env_overrides = collect_env_overrides(args)?;
     let dry_run = args.iter().any(|a| a == "--dry-run");
+    // The game's own switches ride along: a renderer switch such as `-force-d3d11` is not this
+    // tool's to interpret, and dropping it silently would make the option look broken.
+    let game_args = {
+        let forwarded = forwarded_args(args);
+        if forwarded.is_empty() {
+            LAUNCHER_ARGS.to_string()
+        } else {
+            format!("{LAUNCHER_ARGS} {forwarded}")
+        }
+    };
+    log(&format!("game args : {game_args}"));
     for (name, value) in &env_overrides {
         log(&format!("env override: {name}={value}"));
     }
@@ -855,7 +908,7 @@ fn run(args: &[String]) -> Result<(), String> {
         log(&format!(
             "dry run   : would start \"{}\" {}",
             game_exe.display(),
-            LAUNCHER_ARGS
+            game_args
         ));
         log(&format!("dry run   : working directory {}", game_dir.display()));
         log(&format!(
@@ -883,6 +936,7 @@ fn run(args: &[String]) -> Result<(), String> {
         &game_dir,
         parent.process,
         environment_block.as_mut(),
+        &game_args,
     ) {
         Ok(child) => child,
         Err(error) => {
@@ -1169,6 +1223,65 @@ mod tests {
         assert!(describe_exit(WAIT_OBJECT_0, None).contains("unknown"));
         assert!(describe_exit(WAIT_FAILED, Some(3)).contains("WAIT_FAILED"));
         assert!(describe_exit(0x102, None).contains("0x00000102"));
+    }
+
+    #[test]
+    fn unknown_switches_reach_the_game() {
+        assert_eq!(forwarded_args(&args(&["-force-d3d11"])), "-force-d3d11");
+        assert_eq!(
+            forwarded_args(&args(&["-force-d3d11", "-windowed"])),
+            "-force-d3d11 -windowed"
+        );
+    }
+
+    #[test]
+    fn launcher_options_are_never_forwarded() {
+        assert_eq!(forwarded_args(&args(&["--no-reshade"])), "");
+        assert_eq!(forwarded_args(&args(&["--console", "--no-popup"])), "");
+        assert_eq!(forwarded_args(&args(&["--dry-run"])), "");
+        assert_eq!(forwarded_args(&args(&["--help"])), "");
+        assert_eq!(forwarded_args(&args(&["-h"])), "");
+    }
+
+    #[test]
+    fn option_values_are_not_forwarded_as_switches() {
+        assert_eq!(
+            forwarded_args(&args(&["--game-dir", "D:/game", "-dx11"])),
+            "-dx11"
+        );
+        assert_eq!(
+            forwarded_args(&args(&["--game-dir=D:/game", "-dx11"])),
+            "-dx11"
+        );
+        assert_eq!(
+            forwarded_args(&args(&["--env", "FMT=1", "-dx11"])),
+            "-dx11"
+        );
+    }
+
+    #[test]
+    fn a_missing_option_value_cannot_swallow_a_switch() {
+        // `--game-dir` followed by another option is already an error path; the switch after it
+        // still belongs to the game rather than being eaten as a directory.
+        assert_eq!(
+            forwarded_args(&args(&["--game-dir", "--no-reshade", "-dx11"])),
+            "-dx11"
+        );
+    }
+
+    #[test]
+    fn forwarded_switches_keep_their_order_around_options() {
+        assert_eq!(
+            forwarded_args(&args(&[
+                "-dx11",
+                "--no-reshade",
+                "-windowed",
+                "--env",
+                "A=1",
+                "-r1600",
+            ])),
+            "-dx11 -windowed -r1600"
+        );
     }
 }
 

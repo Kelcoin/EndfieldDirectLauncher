@@ -28,6 +28,7 @@
 - **不碰游戏本体**：只从一个带发行商签名的 exe 复制出临时副本当父进程，结束后删除。
 - **能加进 Steam 库**：库里正常显示「运行中」，退出后自动收尾（含清掉 `steam_appid.txt`）。
 - **参数可控**：`--no-reshade` 在装了 ReShade 时关掉后期处理；`--dry-run` 只看不跑，`--no-popup` 给无人值守用。
+- **游戏自己的开关能传进去**：本程序不认识的参数原样加在 `Endfield.exe` 命令行末尾，`-force-d3d11`、`-force-vulkan`、`-windowed` 这类渲染后端开关因此可用。
 
 ## 快速开始
 
@@ -62,6 +63,7 @@ F:\Hypergryph Launcher\games\Arknights Endfield\
 | `--dry-run` | 只打印将要执行的命令行与环境变量，不启动游戏。 |
 | `--no-popup` | 出错不弹框，只写日志。给脚本与计划任务用。 |
 | `--help` | 打印帮助（首行带版本号）。 |
+| `<其它参数>` | 本程序不认识的参数原样传给游戏本体，例如 `-force-d3d11`、`-force-vulkan`、`-windowed`。 |
 
 ### 逐个说明
 
@@ -108,6 +110,20 @@ F:\Hypergryph Launcher\games\Arknights Endfield\
 
 打印上面这些说明，第一行带版本号，可以用来确认手上这份 exe 是新是旧。`-h` 是同一个参数的短写法。
 
+**`<其它参数>`**
+
+本程序不认识的参数会被原样拼到游戏命令行末尾，排在它自己固定发送的 `-launcher_lang=zh-cn -launcher_sub_channel=1` 后面。
+Unity 那套渲染后端开关就是这么用的：
+
+```text
+EndfieldDirectLauncher.exe -force-d3d11
+EndfieldDirectLauncher.exe -force-vulkan -windowed
+```
+
+转发是照抄，不做校验也不改名：写错一个字母，游戏会当成未知开关忽略，不会报错。
+上面的 `--xxx` 是本程序自己的参数，不会被转发；`--game-dir`、`--env` 后面跟的值也不会被当成开关。
+日志里的 `game args :` 一行记录最终拼出来的命令行，拿不准时先加 `--dry-run` 看它会传什么。
+
 ### 通用规则
 
 - 同一个参数写多次，**最后一次生效**；
@@ -146,6 +162,13 @@ arguments : ["--no-reshade"]
 更新过仓库却忘了把新 exe 复制进游戏目录时，旧版本会把这个参数当未知参数直接忽略，表现和「参数不管用」一模一样。
 
 ## 常见问题
+
+### 怎么让游戏换渲染后端（DX11 / DX12 / Vulkan）？
+
+把 Unity 的开关当普通参数接上即可，例如 `EndfieldDirectLauncher.exe -force-d3d11`：本程序不认识的参数会原样交给 `Endfield.exe`。
+
+但**这个客户端到底编进了哪个后端，本程序管不了**：它只负责把参数送进去，游戏自己不支持就会忽略或起不来。
+实测本机默认走的是 Vulkan（`-force-d3d11` 的表现见「已知限制与未验证项」）。
 
 ### 为什么不能直接双击 `Endfield.exe`？
 
@@ -243,7 +266,7 @@ AppID，而你的库条目并不是这个 id），就把进程算到 `457962` �
 > 自己退出）。job 是在游戏进程**创建之后**才挂上的：用 `PROC_THREAD_ATTRIBUTE_PARENT_PROCESS` 创建的子进程
 > 会继承**名义父进程**的 job，挂早了会把游戏也圈进去，那样杀掉本程序就等于杀掉游戏。
 
-命令行与官方启动器完全一致（取自启动器自己的 `games.log`）：
+固定发送的两条参数与官方启动器一致（取自启动器自己的 `games.log`）；用户额外加的开关会接在它们后面：
 
 ```
 "…\games\Endfield Game\Endfield.exe" -launcher_lang=zh-cn -launcher_sub_channel=1
@@ -266,6 +289,18 @@ Sat Oct 17 17:59:50 2026 UTC - GameOverlayRenderer.dll detaching
 ```
 
 替代方案：NVIDIA 覆盖层（`Alt+Z` 打开、`Alt+F1` 截图），或用游戏自带的截图键。
+
+### 换渲染后端：`-force-d3d11` 本机能传进去，但客户端会自己退出
+
+本程序只负责把开关转交给 `Endfield.exe`，后端支持与否由游戏决定。本机实测（2026-11-27，国服客户端）：
+
+- ReShade 日志里出现 `Redirecting D3D11CreateDevice … FeatureLevels = 1`（feature level 11_0）与
+  `IDXGIFactory2::CreateSwapChainForHwnd`，说明参数确实进了游戏、D3D11 设备和交换链都建起来了；
+- 但进程在约两分钟后以**退出码 0** 自己结束，窗口始终没出现，Windows 应用日志里也没有崩溃事件
+  ——不是崩溃，是客户端主动退出。
+
+结论：这个客户端能跑的是默认后端，`-force-d3d11` 属于「能传进去但跑不起来」。`-force-d3d12` 与
+  `-force-vulkan` 未实测。
 
 ### 未验证项
 

@@ -202,7 +202,7 @@ fn the_file_is_plain_utf8_lf_without_trailing_blanks() {
 
 #[test]
 fn no_stale_version_numbers() {
-    for stale in ["0.1.0", "0.1.1", "0.1.2"] {
+    for stale in ["0.1.0", "0.1.1", "0.1.2", "0.1.3"] {
         assert!(!README.contains(stale), "README 残留旧版本号 {stale}");
     }
     assert!(
